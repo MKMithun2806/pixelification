@@ -1666,7 +1666,12 @@ def main():
         "img2ascii": _cli_img2ascii,
         "help": lambda _: parser.print_help(),
     }
-    handlers[args.command](args)
+    try:
+        handlers[args.command](args)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(1)
 
 
 # ── Entry Point ──────────────────────────────────────────────────────
