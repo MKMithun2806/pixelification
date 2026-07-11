@@ -175,9 +175,15 @@ pipx run pixelification
 
 ---
 
-## ◈ Usage
+## ◈ Usage — TUI
 
-A keyboard-navigated terminal UI opens immediately:
+Launch the interactive terminal UI (no arguments needed):
+
+```bash
+pixelification
+```
+
+A keyboard-navigated menu opens:
 
 ```
   ■ Pixel Rearrangement Tool
@@ -222,6 +228,49 @@ A keyboard-navigated terminal UI opens immediately:
 3. Use `Shift+arrows` to scroll, `PgUp`/`PgDn` to jump by page
 4. **"Copy to Clipboard"** pipes the full result to your system clipboard (`clip.exe`)
 5. **"Save Result"** writes a `.txt` file to the current directory
+
+---
+
+## ◈ Usage — CLI
+
+For scripting, batch processing, or headless environments, use the subcommand interface:
+
+```bash
+pixelification img2img <source> <target> [options]
+pixelification vid2vid <source> <target> [options]
+pixelification img2ascii <image> [options]
+```
+
+Output paths default to auto-named files in the current directory (e.g. `reconstructed_src_from_tgt.png`).
+
+### Commands
+
+```
+pixelification img2img <source> <target>
+  Rearrange pixels from a source image to approximate a target image.
+
+  -o, --output FILE    output image path (default: auto-named)
+  --show               open an OpenCV window with the result
+  --cpu                force CPU-only mode
+
+pixelification vid2vid <source> <target>
+  Rearrange every frame of a source (video or still image) to match
+  a target video. Prints a progress bar to stderr.
+
+  -o, --output FILE    output video path (default: auto-named)
+  --show               play the result in an OpenCV window
+  --cpu                force CPU-only mode
+
+pixelification img2ascii <image>
+  Convert an image to ASCII art. Prints to stdout and saves to file.
+
+  -o, --output FILE    output text path (default: auto-named)
+  -w, --width CHARS    output width in characters (default: 120)
+  --no-dither          disable Floyd-Steinberg dithering
+
+pixelification --version / -v
+  Print the installed version.
+```
 
 ---
 
