@@ -121,6 +121,7 @@ ASCII_ART = [
 ]
 
 _IMAGE_EXTS = frozenset({'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp'})
+_VIDEO_EXTS = frozenset({'.mp4', '.avi', '.mov', '.mkv', '.webm'})
 
 
 # ── Native File Dialog ───────────────────────────────────────────────
@@ -526,6 +527,11 @@ def _compute_video_rearrangement(
     w_tgt = int(cap_tgt.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_tgt = int(cap_tgt.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    if w_src == 0 or h_src == 0:
+        raise ValueError(f"source is not a valid video file (0x0 dimensions)")
+    if w_tgt == 0 or h_tgt == 0:
+        raise ValueError(f"target is not a valid video file (0x0 dimensions)")
+
     ar_src = w_src / h_src
     ar_tgt = w_tgt / h_tgt
     ar_diff = abs(ar_src - ar_tgt) > 0.01
@@ -835,109 +841,144 @@ def _progress_bar(current, total, bar_len=20):
 
 
 def _cli_img2img(args):
-    if args.cpu:
-        global FORCE_CPU; FORCE_CPU = True
+    try:
+        if args.cpu:
+            global FORCE_CPU; FORCE_CPU = True
 
-    out_path = args.output
-    if not out_path:
-        src_stem = Path(args.source).stem
-        tgt_stem = Path(args.target).stem
-        out_path = f"reconstructed_{src_stem}_from_{tgt_stem}.png"
+        src_ext = Path(args.source).suffix.lower()
+        tgt_ext = Path(args.target).suffix.lower()
+        if src_ext not in _IMAGE_EXTS:
+            print(f"Error: source must be an image ({', '.join(sorted(_IMAGE_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+        if tgt_ext not in _IMAGE_EXTS:
+            print(f"Error: target must be an image ({', '.join(sorted(_IMAGE_EXTS))})", file=sys.stderr)
+            sys.exit(1)
 
-    result = _compute_rearrangement(args.source, args.target)
-    cv2.imwrite(out_path, result)
-    print(out_path)
+        out_path = args.output
+        if not out_path:
+            src_stem = Path(args.source).stem
+            tgt_stem = Path(args.target).stem
+            out_path = f"reconstructed_{src_stem}_from_{tgt_stem}.png"
 
-    if args.show:
-        img_src = cv2.imread(args.source, cv2.IMREAD_COLOR)
-        img_tgt = cv2.imread(args.target, cv2.IMREAD_COLOR)
-        h, w = img_src.shape[:2]
-        img_tgt = cv2.resize(img_tgt, (w, h))
-        sw, sh = get_screen_resolution()
-        canvas = np.full((sh, sw, 3), 32, dtype=np.uint8)
-        label_h = 22
-        pw = sw // 3
-        ph = sh - label_h
-        sc = min(pw / w, ph / h)
-        iw, ih = max(int(w * sc), 1), max(int(h * sc), 1)
-        src_s = cv2.resize(img_src, (iw, ih), interpolation=cv2.INTER_LANCZOS4)
-        tgt_s = cv2.resize(img_tgt, (iw, ih), interpolation=cv2.INTER_LANCZOS4)
-        cx = (pw - iw) // 2
-        cy = label_h + (ph - ih) // 2
-        canvas[cy:cy+ih, cx:cx+iw] = src_s
-        canvas[cy:cy+ih, pw+cx:pw+cx+iw] = tgt_s
-        rec_x = 2 * pw + cx
-        rec_region = canvas[cy:cy+ih, rec_x:rec_x+iw]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        for label, xo in [("Source", 0), ("Target", pw), ("Reconstruction", 2 * pw)]:
-            cv2.rectangle(canvas, (xo, 0), (xo + pw, label_h), (0, 0, 0), -1)
-            cv2.putText(canvas, label, (xo + 6, 16), font, 0.45, (200, 200, 200), 1)
-        wn = "Pixel Rearrangement  (ESC/q  anytime  to  quit)"
-        cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(wn, sw, sh)
-        rec_region[:] = cv2.resize(result, (iw, ih))
-        cv2.imshow(wn, canvas)
-        while True:
-            key = cv2.waitKey(100) & 0xFF
-            if key in (27, ord("q")):
-                break
-        cv2.destroyAllWindows()
+        result = _compute_rearrangement(args.source, args.target)
+        cv2.imwrite(out_path, result)
+        print(out_path)
+
+        if args.show:
+            img_src = cv2.imread(args.source, cv2.IMREAD_COLOR)
+            img_tgt = cv2.imread(args.target, cv2.IMREAD_COLOR)
+            h, w = img_src.shape[:2]
+            img_tgt = cv2.resize(img_tgt, (w, h))
+            sw, sh = get_screen_resolution()
+            canvas = np.full((sh, sw, 3), 32, dtype=np.uint8)
+            label_h = 22
+            pw = sw // 3
+            ph = sh - label_h
+            sc = min(pw / w, ph / h)
+            iw, ih = max(int(w * sc), 1), max(int(h * sc), 1)
+            src_s = cv2.resize(img_src, (iw, ih), interpolation=cv2.INTER_LANCZOS4)
+            tgt_s = cv2.resize(img_tgt, (iw, ih), interpolation=cv2.INTER_LANCZOS4)
+            cx = (pw - iw) // 2
+            cy = label_h + (ph - ih) // 2
+            canvas[cy:cy+ih, cx:cx+iw] = src_s
+            canvas[cy:cy+ih, pw+cx:pw+cx+iw] = tgt_s
+            rec_x = 2 * pw + cx
+            rec_region = canvas[cy:cy+ih, rec_x:rec_x+iw]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            for label, xo in [("Source", 0), ("Target", pw), ("Reconstruction", 2 * pw)]:
+                cv2.rectangle(canvas, (xo, 0), (xo + pw, label_h), (0, 0, 0), -1)
+                cv2.putText(canvas, label, (xo + 6, 16), font, 0.45, (200, 200, 200), 1)
+            wn = "Pixel Rearrangement  (ESC/q  anytime  to  quit)"
+            cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(wn, sw, sh)
+            rec_region[:] = cv2.resize(result, (iw, ih))
+            cv2.imshow(wn, canvas)
+            while True:
+                key = cv2.waitKey(100) & 0xFF
+                if key in (27, ord("q")):
+                    break
+            cv2.destroyAllWindows()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _cli_vid2vid(args):
-    if args.cpu:
-        global FORCE_CPU; FORCE_CPU = True
-
-    def progress(cur, total):
-        _progress_bar(cur, total)
-
-    result_path = _compute_video_rearrangement(args.source, args.target, progress)
-
-    out_path = args.output
-    if not out_path:
-        src_stem = Path(args.source).stem
-        tgt_stem = Path(args.target).stem
-        out_path = f"rearranged_{src_stem}_from_{tgt_stem}.mp4"
-
-    shutil.copy2(result_path, out_path)
-    print(out_path)
-
     try:
-        os.unlink(result_path)
-    except Exception:
-        pass
+        if args.cpu:
+            global FORCE_CPU; FORCE_CPU = True
 
-    if args.show:
-        cap = cv2.VideoCapture(out_path)
-        wn = "Video Rearrangement Result  (ESC/q  anytime  to  quit)"
-        cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(wn, 1280, 720)
-        while cv2.getWindowProperty(wn, cv2.WND_PROP_VISIBLE) >= 1:
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            cv2.imshow(wn, frame)
-            key = cv2.waitKey(30) & 0xFF
-            if key in (27, ord("q")):
-                break
-        cap.release()
-        cv2.destroyAllWindows()
+        src_ext = Path(args.source).suffix.lower()
+        tgt_ext = Path(args.target).suffix.lower()
+        if src_ext not in _IMAGE_EXTS and src_ext not in _VIDEO_EXTS:
+            print(f"Error: source must be an image or video ({', '.join(sorted(_IMAGE_EXTS | _VIDEO_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+        if tgt_ext not in _VIDEO_EXTS:
+            print(f"Error: target must be a video ({', '.join(sorted(_VIDEO_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+
+        def progress(cur, total):
+            _progress_bar(cur, total)
+
+        result_path = _compute_video_rearrangement(args.source, args.target, progress)
+
+        out_path = args.output
+        if not out_path:
+            src_stem = Path(args.source).stem
+            tgt_stem = Path(args.target).stem
+            out_path = f"rearranged_{src_stem}_from_{tgt_stem}.mp4"
+
+        shutil.copy2(result_path, out_path)
+        print(out_path)
+
+        try:
+            os.unlink(result_path)
+        except Exception:
+            pass
+
+        if args.show:
+            cap = cv2.VideoCapture(out_path)
+            wn = "Video Rearrangement Result  (ESC/q  anytime  to  quit)"
+            cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(wn, 1280, 720)
+            while cv2.getWindowProperty(wn, cv2.WND_PROP_VISIBLE) >= 1:
+                ret, frame = cap.read()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                cv2.imshow(wn, frame)
+                key = cv2.waitKey(30) & 0xFF
+                if key in (27, ord("q")):
+                    break
+            cap.release()
+            cv2.destroyAllWindows()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _cli_img2ascii(args):
-    ascii_str = image_to_ascii(args.image, args.width, not args.no_dither)
-    if not ascii_str:
-        print("Error: could not read image", file=sys.stderr)
+    try:
+        ext = Path(args.image).suffix.lower()
+        if ext not in _IMAGE_EXTS:
+            print(f"Error: input must be an image ({', '.join(sorted(_IMAGE_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+
+        ascii_str = image_to_ascii(args.image, args.width, not args.no_dither)
+        if not ascii_str:
+            print("Error: could not read image", file=sys.stderr)
+            sys.exit(1)
+
+        print(ascii_str)
+
+        out_path = args.output
+        if not out_path:
+            stem = Path(args.image).stem
+            out_path = f"{stem}_ascii.txt"
+        Path(out_path).write_text(ascii_str, encoding="utf-8")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    print(ascii_str)
-
-    out_path = args.output
-    if not out_path:
-        stem = Path(args.image).stem
-        out_path = f"{stem}_ascii.txt"
-    Path(out_path).write_text(ascii_str, encoding="utf-8")
 
 
 # ── TUI Application ──────────────────────────────────────────────────
@@ -1566,6 +1607,21 @@ def main():
     )
     parser.add_argument("--version", "-v", action="store_true", help="print version")
 
+    _orig_error = parser.error
+    def _parser_error(msg):
+        if "invalid choice" in msg:
+            _orig_error(
+                "missing subcommand.\n\n"
+                "  Usage: pixelification <command> [arguments]\n\n"
+                "  Commands:\n"
+                "    img2img   <source> <target>   Rearrange pixels between two images\n"
+                "    vid2vid   <source> <target>   Rearrange frames between two videos\n"
+                "    img2ascii <image>             Convert an image to ASCII art\n"
+                "    help                          Show this help message"
+            )
+        _orig_error(msg)
+    parser.error = _parser_error
+
     sub = parser.add_subparsers(dest="command", metavar="")
 
     p_img2img = sub.add_parser("img2img", help="rearrange pixels between two images")
@@ -1588,6 +1644,8 @@ def main():
     p_ascii.add_argument("-w", "--width", type=int, default=120, help="ASCII output width in characters (default: 120)")
     p_ascii.add_argument("--no-dither", action="store_true", help="disable Floyd-Steinberg dithering")
 
+    p_help = sub.add_parser("help", help="show this help message and exit")
+
     args = parser.parse_args()
 
     if args.version:
@@ -1606,6 +1664,7 @@ def main():
         "img2img": _cli_img2img,
         "vid2vid": _cli_vid2vid,
         "img2ascii": _cli_img2ascii,
+        "help": lambda _: parser.print_help(),
     }
     handlers[args.command](args)
 
