@@ -5,6 +5,7 @@ Rearrange image pixels or video frames via colour-sort optimal transport.
 OpenCV window shows the result (animation for images, playback for video).
 """
 
+import argparse
 import asyncio
 import cv2
 import numpy as np
@@ -279,6 +280,31 @@ def compute_sort_keys(img, xp=np):
     return lum, hsv[:, 0], hsv[:, 1]
 
 
+def _compute_rearrangement(source_path: str, target_path: str) -> np.ndarray:
+    img_src = cv2.imread(source_path, cv2.IMREAD_COLOR)
+    img_tgt = cv2.imread(target_path, cv2.IMREAD_COLOR)
+    if img_src is None:
+        raise FileNotFoundError(f"Cannot read source: {source_path}")
+    if img_tgt is None:
+        raise FileNotFoundError(f"Cannot read target: {target_path}")
+
+    h, w = img_src.shape[:2]
+    img_tgt = cv2.resize(img_tgt, (w, h))
+
+    xp = get_xp()
+    s_l, s_h, s_s = compute_sort_keys(img_src, xp)
+    t_l, t_h, t_s = compute_sort_keys(img_tgt, xp)
+    s_order = xp_lexsort((s_s, s_h, s_l), xp)
+    t_order = xp_lexsort((t_s, t_h, t_l), xp)
+
+    out_flat = xp.empty_like(xp.array(img_src.reshape(-1, 3)), dtype=xp.uint8)
+    out_flat[t_order] = xp.array(img_src.reshape(-1, 3))[s_order]
+    out_img = out_flat.reshape(h, w, 3)
+    out_img = to_np(out_img)
+
+    return out_img
+
+
 def get_screen_resolution():
     try:
         import ctypes
@@ -459,6 +485,112 @@ def letterbox_pad(img, target_w, target_h):
     y_off = (target_h - new_h) // 2
     canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
     return canvas
+
+
+def _compute_video_rearrangement(
+    source_path: str,
+    target_path: str,
+    progress_callback=None,
+) -> str:
+    src_is_img = Path(source_path).suffix.lower() in _IMAGE_EXTS
+
+    if src_is_img:
+        img_src = cv2.imread(source_path, cv2.IMREAD_COLOR)
+        if img_src is None:
+            raise FileNotFoundError(f"Cannot read source image: {source_path}")
+        h_src, w_src = img_src.shape[:2]
+        cap_tgt = cv2.VideoCapture(target_path)
+        if not cap_tgt.isOpened():
+            raise FileNotFoundError(f"Cannot open target video: {target_path}")
+        total_tgt = int(cap_tgt.get(cv2.CAP_PROP_FRAME_COUNT))
+        total = total_tgt
+        if total == 0:
+            raise ValueError("Target video has no frames")
+        fps = cap_tgt.get(cv2.CAP_PROP_FPS)
+    else:
+        cap_src = cv2.VideoCapture(source_path)
+        cap_tgt = cv2.VideoCapture(target_path)
+        if not cap_src.isOpened():
+            raise FileNotFoundError(f"Cannot open source video: {source_path}")
+        if not cap_tgt.isOpened():
+            raise FileNotFoundError(f"Cannot open target video: {target_path}")
+        total_src = int(cap_src.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_tgt = int(cap_tgt.get(cv2.CAP_PROP_FRAME_COUNT))
+        total = min(total_src, total_tgt)
+        if total == 0:
+            raise ValueError("One or both videos have no frames")
+        fps = cap_src.get(cv2.CAP_PROP_FPS)
+        h_src = int(cap_src.get(cv2.CAP_PROP_FRAME_WIDTH))
+        w_src = int(cap_src.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    w_tgt = int(cap_tgt.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h_tgt = int(cap_tgt.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    ar_src = w_src / h_src
+    ar_tgt = w_tgt / h_tgt
+    ar_diff = abs(ar_src - ar_tgt) > 0.01
+
+    if ar_diff:
+        if ar_src >= ar_tgt:
+            out_w, out_h = w_src, h_src
+            pad_src, pad_tgt = False, True
+        else:
+            out_w, out_h = w_tgt, h_tgt
+            pad_src, pad_tgt = True, False
+    else:
+        out_w, out_h = w_src, h_src
+        pad_src, pad_tgt = False, False
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(tmp_path, fourcc, fps, (out_w, out_h))
+
+    xp = get_xp()
+
+    for i in range(total):
+        if src_is_img:
+            src_frame = img_src.copy()
+        else:
+            ret_src, src_frame = cap_src.read()
+            if not ret_src:
+                break
+
+        ret_tgt, tgt_frame = cap_tgt.read()
+        if not ret_tgt:
+            break
+
+        if pad_src:
+            src_frame = letterbox_pad(src_frame, out_w, out_h)
+        if pad_tgt:
+            tgt_frame = letterbox_pad(tgt_frame, out_w, out_h)
+        if not pad_src and not pad_tgt and tgt_frame.shape[:2] != src_frame.shape[:2]:
+            tgt_frame = cv2.resize(tgt_frame, (out_w, out_h))
+
+        s_l, s_h, s_s = compute_sort_keys(src_frame, xp)
+        t_l, t_h, t_s = compute_sort_keys(tgt_frame, xp)
+        s_order = xp_lexsort((s_s, s_h, s_l), xp)
+        t_order = xp_lexsort((t_s, t_h, t_l), xp)
+
+        src_flat = xp.array(src_frame.reshape(-1, 3))
+        out_flat = xp.empty_like(src_flat, dtype=xp.uint8)
+        out_flat[t_order] = src_flat[s_order]
+        out_frame = out_flat.reshape(out_h, out_w, 3)
+
+        out_frame = to_np(out_frame)
+
+        writer.write(out_frame)
+
+        if progress_callback:
+            progress_callback(i + 1, total)
+
+    if not src_is_img:
+        cap_src.release()
+    cap_tgt.release()
+    writer.release()
+
+    return tmp_path
 
 
 def rearrange_video(source_path: str, target_path: str, state: State) -> None:
@@ -690,6 +822,122 @@ def image_to_ascii(path: str, width: int = 120, dither: bool = True) -> str:
     for row in idx:
         lines.append("".join(ramp[i] for i in row))
     return "\n".join(lines)
+
+
+# ── CLI Handlers ─────────────────────────────────────────────────────
+
+def _progress_bar(current, total, bar_len=20):
+    filled = int(bar_len * current / total)
+    bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+    print(f"\r  [{bar}] {current}/{total} ({100*current/total:.0f}%)", end="", file=sys.stderr)
+    if current == total:
+        print(file=sys.stderr)
+
+
+def _cli_img2img(args):
+    if args.cpu:
+        global FORCE_CPU; FORCE_CPU = True
+
+    out_path = args.output
+    if not out_path:
+        src_stem = Path(args.source).stem
+        tgt_stem = Path(args.target).stem
+        out_path = f"reconstructed_{src_stem}_from_{tgt_stem}.png"
+
+    result = _compute_rearrangement(args.source, args.target)
+    cv2.imwrite(out_path, result)
+    print(out_path)
+
+    if args.show:
+        img_src = cv2.imread(args.source, cv2.IMREAD_COLOR)
+        img_tgt = cv2.imread(args.target, cv2.IMREAD_COLOR)
+        h, w = img_src.shape[:2]
+        img_tgt = cv2.resize(img_tgt, (w, h))
+        sw, sh = get_screen_resolution()
+        canvas = np.full((sh, sw, 3), 32, dtype=np.uint8)
+        label_h = 22
+        pw = sw // 3
+        ph = sh - label_h
+        sc = min(pw / w, ph / h)
+        iw, ih = max(int(w * sc), 1), max(int(h * sc), 1)
+        src_s = cv2.resize(img_src, (iw, ih), interpolation=cv2.INTER_LANCZOS4)
+        tgt_s = cv2.resize(img_tgt, (iw, ih), interpolation=cv2.INTER_LANCZOS4)
+        cx = (pw - iw) // 2
+        cy = label_h + (ph - ih) // 2
+        canvas[cy:cy+ih, cx:cx+iw] = src_s
+        canvas[cy:cy+ih, pw+cx:pw+cx+iw] = tgt_s
+        rec_x = 2 * pw + cx
+        rec_region = canvas[cy:cy+ih, rec_x:rec_x+iw]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for label, xo in [("Source", 0), ("Target", pw), ("Reconstruction", 2 * pw)]:
+            cv2.rectangle(canvas, (xo, 0), (xo + pw, label_h), (0, 0, 0), -1)
+            cv2.putText(canvas, label, (xo + 6, 16), font, 0.45, (200, 200, 200), 1)
+        wn = "Pixel Rearrangement  (ESC/q  anytime  to  quit)"
+        cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(wn, sw, sh)
+        rec_region[:] = cv2.resize(result, (iw, ih))
+        cv2.imshow(wn, canvas)
+        while True:
+            key = cv2.waitKey(100) & 0xFF
+            if key in (27, ord("q")):
+                break
+        cv2.destroyAllWindows()
+
+
+def _cli_vid2vid(args):
+    if args.cpu:
+        global FORCE_CPU; FORCE_CPU = True
+
+    def progress(cur, total):
+        _progress_bar(cur, total)
+
+    result_path = _compute_video_rearrangement(args.source, args.target, progress)
+
+    out_path = args.output
+    if not out_path:
+        src_stem = Path(args.source).stem
+        tgt_stem = Path(args.target).stem
+        out_path = f"rearranged_{src_stem}_from_{tgt_stem}.mp4"
+
+    shutil.copy2(result_path, out_path)
+    print(out_path)
+
+    try:
+        os.unlink(result_path)
+    except Exception:
+        pass
+
+    if args.show:
+        cap = cv2.VideoCapture(out_path)
+        wn = "Video Rearrangement Result  (ESC/q  anytime  to  quit)"
+        cv2.namedWindow(wn, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(wn, 1280, 720)
+        while cv2.getWindowProperty(wn, cv2.WND_PROP_VISIBLE) >= 1:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            cv2.imshow(wn, frame)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (27, ord("q")):
+                break
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def _cli_img2ascii(args):
+    ascii_str = image_to_ascii(args.image, args.width, not args.no_dither)
+    if not ascii_str:
+        print("Error: could not read image", file=sys.stderr)
+        sys.exit(1)
+
+    print(ascii_str)
+
+    out_path = args.output
+    if not out_path:
+        stem = Path(args.image).stem
+        out_path = f"{stem}_ascii.txt"
+    Path(out_path).write_text(ascii_str, encoding="utf-8")
 
 
 # ── TUI Application ──────────────────────────────────────────────────
@@ -1312,14 +1560,54 @@ class PixelTUI:
 
 
 def main():
-    if "--version" in sys.argv or "-v" in sys.argv:
+    parser = argparse.ArgumentParser(
+        prog="pixelification",
+        description="Rearrange image pixels via colour-sort optimal transport.",
+    )
+    parser.add_argument("--version", "-v", action="store_true", help="print version")
+
+    sub = parser.add_subparsers(dest="command", metavar="")
+
+    p_img2img = sub.add_parser("img2img", help="rearrange pixels between two images")
+    p_img2img.add_argument("source", help="source image path")
+    p_img2img.add_argument("target", help="target image path")
+    p_img2img.add_argument("-o", "--output", help="output image path (default: auto-named)")
+    p_img2img.add_argument("--show", action="store_true", help="show the result in an OpenCV window")
+    p_img2img.add_argument("--cpu", action="store_true", help="force CPU mode")
+
+    p_vid2vid = sub.add_parser("vid2vid", help="rearrange frames between two videos (or image->video)")
+    p_vid2vid.add_argument("source", help="source video or image path")
+    p_vid2vid.add_argument("target", help="target video path")
+    p_vid2vid.add_argument("-o", "--output", help="output video path (default: auto-named)")
+    p_vid2vid.add_argument("--show", action="store_true", help="play the result in an OpenCV window")
+    p_vid2vid.add_argument("--cpu", action="store_true", help="force CPU mode")
+
+    p_ascii = sub.add_parser("img2ascii", help="convert an image to ASCII art")
+    p_ascii.add_argument("image", help="source image path")
+    p_ascii.add_argument("-o", "--output", help="output text path (default: auto-named)")
+    p_ascii.add_argument("-w", "--width", type=int, default=120, help="ASCII output width in characters (default: 120)")
+    p_ascii.add_argument("--no-dither", action="store_true", help="disable Floyd-Steinberg dithering")
+
+    args = parser.parse_args()
+
+    if args.version:
         try:
             print(f"pixelification {version('pixelification')}")
         except PackageNotFoundError:
             print("pixelification (local development)")
         return
-    runtime_config = load_or_create_runtime_config(HAS_CUPY)
-    PixelTUI(runtime_config).run()
+
+    if not args.command:
+        runtime_config = load_or_create_runtime_config(HAS_CUPY)
+        PixelTUI(runtime_config).run()
+        return
+
+    handlers = {
+        "img2img": _cli_img2img,
+        "vid2vid": _cli_vid2vid,
+        "img2ascii": _cli_img2ascii,
+    }
+    handlers[args.command](args)
 
 
 # ── Entry Point ──────────────────────────────────────────────────────
