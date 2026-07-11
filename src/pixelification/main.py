@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,11 @@ from pixelification.runtime import RuntimeConfig, load_or_create_runtime_config
 # ── GPU & Accelerator Support ────────────────────────────────────────
 
 FORCE_CPU = False
+_RUNNING = True
+
+def _sigint_handler(signum, frame):
+    global _RUNNING
+    _RUNNING = False
 
 try:
     import cupy as cp
@@ -556,6 +562,9 @@ def _compute_video_rearrangement(
     xp = get_xp()
 
     for i in range(total):
+        if not _RUNNING:
+            raise KeyboardInterrupt()
+
         if src_is_img:
             src_frame = img_src.copy()
         else:
@@ -1666,12 +1675,14 @@ def main():
         "img2ascii": _cli_img2ascii,
         "help": lambda _: parser.print_help(),
     }
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     try:
         handlers[args.command](args)
     except KeyboardInterrupt:
         print(file=sys.stderr)
         print("Interrupted.", file=sys.stderr)
-        sys.exit(1)
+        os._exit(1)
 
 
 # ── Entry Point ──────────────────────────────────────────────────────
