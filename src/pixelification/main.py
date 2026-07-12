@@ -25,6 +25,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, Window, FormattedTextControl
 from prompt_toolkit.styles import Style
 from pixelification.runtime import RuntimeConfig, load_or_create_runtime_config
+from pixelification.audio import rearrange_audio
 
 # ── GPU & Accelerator Support ────────────────────────────────────────
 
@@ -128,6 +129,7 @@ ASCII_ART = [
 
 _IMAGE_EXTS = frozenset({'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp'})
 _VIDEO_EXTS = frozenset({'.mp4', '.avi', '.mov', '.mkv', '.webm'})
+_AUDIO_EXTS = frozenset({'.wav', '.flac', '.ogg', '.aiff', '.aif'})
 
 
 # ── Native File Dialog ───────────────────────────────────────────────
@@ -990,6 +992,33 @@ def _cli_img2ascii(args):
         sys.exit(1)
 
 
+def _cli_aud2aud(args):
+    try:
+        if args.cpu:
+            global FORCE_CPU; FORCE_CPU = True
+
+        src_ext = Path(args.source).suffix.lower()
+        tgt_ext = Path(args.target).suffix.lower()
+        if src_ext not in _AUDIO_EXTS:
+            print(f"Error: source must be an audio file ({', '.join(sorted(_AUDIO_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+        if tgt_ext not in _AUDIO_EXTS:
+            print(f"Error: target must be an audio file ({', '.join(sorted(_AUDIO_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+
+        out_path = args.output
+        if not out_path:
+            src_stem = Path(args.source).stem
+            tgt_stem = Path(args.target).stem
+            out_path = f"morphed_{src_stem}_from_{tgt_stem}.wav"
+
+        rearrange_audio(args.source, args.target, out_path)
+        print(out_path)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ── TUI Application ──────────────────────────────────────────────────
 
 class PixelTUI:
@@ -1626,6 +1655,7 @@ def main():
                 "    img2img   <source> <target>   Rearrange pixels between two images\n"
                 "    vid2vid   <source> <target>   Rearrange frames between two videos\n"
                 "    img2ascii <image>             Convert an image to ASCII art\n"
+                "    aud2aud   <source> <target>   Spectral cross-synthesis between two audio files\n"
                 "    help                          Show this help message"
             )
         _orig_error(msg)
@@ -1653,6 +1683,12 @@ def main():
     p_ascii.add_argument("-w", "--width", type=int, default=120, help="ASCII output width in characters (default: 120)")
     p_ascii.add_argument("--no-dither", action="store_true", help="disable Floyd-Steinberg dithering")
 
+    p_aud2aud = sub.add_parser("aud2aud", help="spectral cross-synthesis between two audio files")
+    p_aud2aud.add_argument("source", help="source audio path")
+    p_aud2aud.add_argument("target", help="target audio path")
+    p_aud2aud.add_argument("-o", "--output", help="output audio path (default: auto-named)")
+    p_aud2aud.add_argument("--cpu", action="store_true", help="force CPU mode")
+
     p_help = sub.add_parser("help", help="show this help message and exit")
 
     args = parser.parse_args()
@@ -1673,6 +1709,7 @@ def main():
         "img2img": _cli_img2img,
         "vid2vid": _cli_vid2vid,
         "img2ascii": _cli_img2ascii,
+        "aud2aud": _cli_aud2aud,
         "help": lambda _: parser.print_help(),
     }
     signal.signal(signal.SIGINT, _sigint_handler)
