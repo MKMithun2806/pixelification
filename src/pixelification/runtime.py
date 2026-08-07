@@ -16,6 +16,7 @@ class RuntimeConfig:
     host_os: str
     hardware_acceleration_available: bool
     backend: str
+    audio_settings: dict | None = None
 
 
 def _config_root() -> Path:
@@ -46,16 +47,21 @@ def load_or_create_runtime_config(hardware_acceleration_available: bool) -> Runt
         backend="cupy" if hardware_acceleration_available else "cpu",
     )
 
+    stored_audio = None
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                stored_audio = data.get("audio_settings")
+                if not isinstance(stored_audio, dict):
+                    stored_audio = None
                 stored = RuntimeConfig(
                     host_os=str(data.get("host_os", current.host_os)),
                     hardware_acceleration_available=bool(
                         data.get("hardware_acceleration_available", current.hardware_acceleration_available)
                     ),
                     backend=str(data.get("backend", current.backend)),
+                    audio_settings=stored_audio,
                 )
                 if (
                     stored.host_os == current.host_os
@@ -64,11 +70,31 @@ def load_or_create_runtime_config(hardware_acceleration_available: bool) -> Runt
                 ):
                     return stored
         except Exception:
-            pass
+            stored_audio = None
 
+    current.audio_settings = stored_audio
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(asdict(current), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return current
+
+
+def save_audio_settings(audio_settings: dict) -> None:
+    """Merge new audio settings into the persisted runtime config."""
+    path = config_path()
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+    data["audio_settings"] = audio_settings
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
