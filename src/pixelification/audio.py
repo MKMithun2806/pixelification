@@ -18,11 +18,11 @@ PHASE_MODES = ("source", "target", "random")
 @dataclass
 class AudioSettings:
     # ── what we allow the rearrangement to change ──────────────────
-    reorder_time: bool = True        # cut into segments and reorder them
-    remap_spectrum: bool = False     # spectral magnitude remapping (STFT)
+    reorder_time: bool = False       # cut into segments and reorder them
+    remap_spectrum: bool = True      # spectral magnitude remapping (STFT)
     shape_pitch: bool = False        # pitch shift (semitones)
     remap_energy: bool = False       # per-segment loudness matching to target
-    normalize: bool = True           # peak-normalize the output
+    normalize: bool = False          # peak-normalize the output
 
     # ── segmentation / dsp ─────────────────────────────────────────
     segment_ms: float = 60.0         # segment length for time reorder

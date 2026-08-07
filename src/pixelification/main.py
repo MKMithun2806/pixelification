@@ -1089,6 +1089,10 @@ def _audio_settings_from_args(args):
     d = AudioSettings.default().to_dict()
     if getattr(args, "spectral", False):
         d["remap_spectrum"] = True
+    if getattr(args, "no_spectral", False):
+        d["remap_spectrum"] = False
+    if getattr(args, "time", False):
+        d["reorder_time"] = True
     if getattr(args, "no_time", False):
         d["reorder_time"] = False
     if getattr(args, "energy", False):
@@ -2131,7 +2135,7 @@ def main():
                 "    img2img   <source> <target>   Rearrange pixels between two images\n"
                 "    vid2vid   <source> <target>   Rearrange frames between two videos\n"
                 "    img2ascii <image>             Convert an image to ASCII art\n"
-                "    aud2aud   <source> <target>   Rearrange segments between two audio files\n"
+                "    aud2aud   <source> <target>   Rearrange audio (spectral cross-synthesis by default)\n"
                 "    help                          Show this help message"
             )
         _orig_error(msg)
@@ -2159,13 +2163,17 @@ def main():
     p_ascii.add_argument("-w", "--width", type=int, default=120, help="ASCII output width in characters (default: 120)")
     p_ascii.add_argument("--no-dither", action="store_true", help="disable Floyd-Steinberg dithering")
 
-    p_aud2aud = sub.add_parser("aud2aud", help="rearrange segments between two audio files")
+    p_aud2aud = sub.add_parser("aud2aud", help="rearrange audio (spectral cross-synthesis by default)")
     p_aud2aud.add_argument("source", help="source audio path")
     p_aud2aud.add_argument("target", help="target audio path")
     p_aud2aud.add_argument("-o", "--output", help="output audio path (default: auto-named)")
     p_aud2aud.add_argument("--cpu", action="store_true", help="force CPU mode")
     p_aud2aud.add_argument("--spectral", action="store_true",
-                          help="also remap the frequency spectrum (STFT cross-synthesis)")
+                          help="enable spectral magnitude remapping (STFT, on by default)")
+    p_aud2aud.add_argument("--no-spectral", action="store_true",
+                          help="disable spectral frequency remapping")
+    p_aud2aud.add_argument("--time", action="store_true",
+                          help="enable time-domain segment reordering")
     p_aud2aud.add_argument("--no-time", action="store_true",
                           help="disable time-domain segment reordering")
     p_aud2aud.add_argument("--chunk-ms", type=float,
