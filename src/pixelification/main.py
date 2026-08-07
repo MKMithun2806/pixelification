@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
 
@@ -24,7 +24,13 @@ from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, Window, FormattedTextControl
 from prompt_toolkit.styles import Style
-from pixelification.runtime import RuntimeConfig, load_or_create_runtime_config
+from pixelification.runtime import RuntimeConfig, load_or_create_runtime_config, save_audio_settings
+from pixelification.audio import rearrange_audio, AudioSettings
+try:
+    import soundfile as sf
+    HAS_SOUNDFILE = True
+except ImportError:
+    HAS_SOUNDFILE = False
 
 # ── GPU & Accelerator Support ────────────────────────────────────────
 
@@ -128,6 +134,7 @@ ASCII_ART = [
 
 _IMAGE_EXTS = frozenset({'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp'})
 _VIDEO_EXTS = frozenset({'.mp4', '.avi', '.mov', '.mkv', '.webm'})
+_AUDIO_EXTS = frozenset({'.wav', '.flac', '.ogg', '.aiff', '.aif', '.mp3'})
 
 
 # ── Native File Dialog ───────────────────────────────────────────────
@@ -136,6 +143,9 @@ def _powershell_open_file(title: str, file_type: str = "image") -> str | None:
     if file_type == "video":
         filt = ("Video Files (*.mp4;*.avi;*.mov;*.mkv;*.webm)|"
                 "*.mp4;*.avi;*.mov;*.mkv;*.webm|All Files (*.*)|*.*")
+    elif file_type == "audio":
+        filt = ("Audio Files (*.wav;*.flac;*.ogg;*.aiff;*.aif;*.mp3)|"
+                "*.wav;*.flac;*.ogg;*.aiff;*.aif;*.mp3|All Files (*.*)|*.*")
     elif file_type == "media":
         filt = ("Media Files (*.mp4;*.avi;*.mov;*.mkv;*.webm;*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.gif;*.webm)|"
                 "*.mp4;*.avi;*.mov;*.mkv;*.webm;*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.gif;*.webm|"
@@ -187,6 +197,11 @@ def _tkinter_open_file(title: str, file_type: str = "image") -> str | None:
                 ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"),
                 ("All files",   "*.*"),
             ]
+        elif file_type == "audio":
+            filetypes = [
+                ("Audio files", "*.wav *.flac *.ogg *.aiff *.aif *.mp3"),
+                ("All files",   "*.*"),
+            ]
         elif file_type == "media":
             filetypes = [
                 ("Media files", "*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp"),
@@ -219,7 +234,7 @@ def select_file(title: str = "Select File", file_type: str = "image") -> str | N
 
 @dataclass
 class State:
-    screen: str = "main"        # "main" | "image" | "video" | "ascii"
+    screen: str = "main"        # "main" | "image" | "video" | "audio" | "ascii"
     source: str = ""
     target: str = ""
     status: str = "Ready"
@@ -230,15 +245,20 @@ class State:
     done: bool = False
     result: np.ndarray | None = None
     result_video_path: str = ""
+    result_audio_path: str = ""
     using_accelerator: bool = HAS_CUPY
     acceleration_status: str = CUPY_STATUS_TEXT
     result_ascii: str = ""
     scroll_x: int = 0
     scroll_y: int = 0
+    audio_settings: AudioSettings = field(default_factory=AudioSettings.default)
+    settings_edit_key: str | None = None
+    settings_edit_buffer: str = ""
 
     MENU_MAIN = [
         ("Rearrange Images", "sort pixels between two images"),
         ("Rearrange Videos", "sort frames between two videos"),
+        ("Rearrange Audio", "spectral cross-synthesis between two audio clips"),
         ("ASCII", "convert images to ASCII art"),
         ("Quit", "exit the application"),
     ]
@@ -261,6 +281,17 @@ class State:
         ("Quit",                  "exit the application"),
     ]
 
+    MENU_AUDIO = [
+        ("Select Source Audio",   "choose the source audio file"),
+        ("Select Target Audio",   "choose the target audio file"),
+        ("Advanced Audio Options", "tune what the rearrangement may change"),
+        ("Run Audio Rearrangement", "rearrange audio per the current settings"),
+        ("Play Result Audio",     "preview the morphed audio with system player"),
+        ("Save Result Audio",     "save the morphed audio to disk"),
+        ("Back to Main Menu",     "return to mode selection"),
+        ("Quit",                  "exit the application"),
+    ]
+
     MENU_ASCII = [
         ("Select Image",          "choose an image to convert"),
         ("Run ASCII Conversion",  "convert the selected image to ASCII art"),
@@ -272,7 +303,43 @@ class State:
 
     @property
     def menu(self):
-        return {"main": self.MENU_MAIN, "image": self.MENU_IMAGE, "video": self.MENU_VIDEO, "ascii": self.MENU_ASCII}[self.screen]
+        return {"main": self.MENU_MAIN, "image": self.MENU_IMAGE, "video": self.MENU_VIDEO, "audio": self.MENU_AUDIO, "ascii": self.MENU_ASCII}[self.screen]
+
+
+# ── Audio Advanced Settings ───────────────────────────────────────────
+
+# rows: (settings_key, label, kind, extra)
+#   kind "bool"         -> extra ()
+#   kind "choice"       -> extra (options,)
+#   kind "float"/"int"  -> extra (step, lo, hi)
+
+AUDIO_SETTINGS_ROWS = [
+    # ── what may change ──
+    ("reorder_time",         "Reorder time segments",     "bool"),
+    ("remap_spectrum",       "Remap frequency spectrum",  "bool"),
+    ("shape_pitch",          "Shift pitch",               "bool"),
+    ("remap_energy",         "Remap loudness / energy",   "bool"),
+    ("normalize",            "Normalize output",          "bool"),
+    # ── segmentation / dsp ──
+    ("segment_ms",           "Segment size (ms)",         "float", (10.0, 20.0, 2000.0)),
+    ("crossfade_ms",         "Crossfade (ms)",            "float", (1.0, 0.0, 100.0)),
+    ("fft_size",             "FFT size",                  "int",   (64, 32, 16384)),
+    ("hop_length",           "Hop length",                "int",   (32, 16, 8192)),
+    # ── sorting / variation ──
+    ("sort_key",             "Sort key",                  "choice", ["energy", "amplitude", "zcr", "centroid", "none"]),
+    ("randomize",            "Randomize order",           "bool"),
+    ("seed",                 "Random seed",               "int",   (1, 0, 9999)),
+    ("reverse",              "Reverse order",             "bool"),
+    # ── pitch ──
+    ("pitch_shift_semitones","Pitch shift (semitones)",   "float", (0.5, -24.0, 24.0)),
+    ("keep_duration",        "Keep duration after pitch", "bool"),
+    # ── spectral phase ──
+    ("phase_mode",           "Spectral phase",            "choice", ["source", "target", "random"]),
+    # ── output ──
+    ("dry_wet",              "Dry/wet mix",               "float", (0.05, 0.0, 1.0)),
+]
+
+AUDIO_SETTINGS_RESET = len(AUDIO_SETTINGS_ROWS)  # final row = reset to defaults
 
 
 # ── Rearrangement Engine ─────────────────────────────────────────────
@@ -990,6 +1057,73 @@ def _cli_img2ascii(args):
         sys.exit(1)
 
 
+def _cli_aud2aud(args):
+    try:
+        if args.cpu:
+            global FORCE_CPU; FORCE_CPU = True
+
+        src_ext = Path(args.source).suffix.lower()
+        tgt_ext = Path(args.target).suffix.lower()
+        if src_ext not in _AUDIO_EXTS:
+            print(f"Error: source must be an audio file ({', '.join(sorted(_AUDIO_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+        if tgt_ext not in _AUDIO_EXTS:
+            print(f"Error: target must be an audio file ({', '.join(sorted(_AUDIO_EXTS))})", file=sys.stderr)
+            sys.exit(1)
+
+        out_path = args.output
+        if not out_path:
+            src_stem = Path(args.source).stem
+            tgt_stem = Path(args.target).stem
+            out_path = f"morphed_{src_stem}_from_{tgt_stem}.wav"
+
+        settings = _audio_settings_from_args(args)
+        rearrange_audio(args.source, args.target, out_path, settings=settings)
+        print(out_path)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _audio_settings_from_args(args):
+    d = AudioSettings.default().to_dict()
+    if getattr(args, "spectral", False):
+        d["remap_spectrum"] = True
+    if getattr(args, "no_spectral", False):
+        d["remap_spectrum"] = False
+    if getattr(args, "time", False):
+        d["reorder_time"] = True
+    if getattr(args, "no_time", False):
+        d["reorder_time"] = False
+    if getattr(args, "energy", False):
+        d["remap_energy"] = True
+    if getattr(args, "no_normalize", False):
+        d["normalize"] = False
+    if getattr(args, "randomize", False):
+        d["randomize"] = True
+    if getattr(args, "reverse", False):
+        d["reverse"] = True
+    if getattr(args, "no_keep_duration", False):
+        d["keep_duration"] = False
+    if getattr(args, "pitch", None) is not None:
+        d["shape_pitch"] = True
+        d["pitch_shift_semitones"] = args.pitch
+    mapping = {
+        "segment_ms": "chunk_ms",
+        "crossfade_ms": "crossfade",
+        "fft_size": "fft",
+        "hop_length": "hop",
+        "sort_key": "sort_key",
+        "seed": "seed",
+        "phase_mode": "phase",
+        "dry_wet": "dry_wet",
+    }
+    for key, aname in mapping.items():
+        if getattr(args, aname, None) is not None:
+            d[key] = getattr(args, aname)
+    return AudioSettings.from_dict(d)
+
+
 # ── TUI Application ──────────────────────────────────────────────────
 
 class PixelTUI:
@@ -997,6 +1131,8 @@ class PixelTUI:
         self.runtime_config = runtime_config
         self.state = State(using_accelerator=runtime_config.hardware_acceleration_available)
         self.state.acceleration_status = CUPY_STATUS_TEXT
+        if getattr(runtime_config, "audio_settings", None):
+            self.state.audio_settings = AudioSettings.from_dict(runtime_config.audio_settings)
 
         self.kb = KeyBindings()
         self._register_bindings()
@@ -1010,31 +1146,76 @@ class PixelTUI:
 
         @kb.add("up")
         def _(event):
-            if not self.state.running:
-                n = len(self.state.menu)
+            if self.state.running or self.state.settings_edit_key is not None:
+                return
+            if self.state.screen == "audio-settings":
+                n = len(AUDIO_SETTINGS_ROWS) + 1
                 self.state.cursor = (self.state.cursor - 1) % n
                 self._invalidate()
+                return
+            n = len(self.state.menu)
+            self.state.cursor = (self.state.cursor - 1) % n
+            self._invalidate()
 
         @kb.add("down")
         def _(event):
-            if not self.state.running:
-                n = len(self.state.menu)
+            if self.state.running or self.state.settings_edit_key is not None:
+                return
+            if self.state.screen == "audio-settings":
+                n = len(AUDIO_SETTINGS_ROWS) + 1
                 self.state.cursor = (self.state.cursor + 1) % n
                 self._invalidate()
+                return
+            n = len(self.state.menu)
+            self.state.cursor = (self.state.cursor + 1) % n
+            self._invalidate()
 
         @kb.add("enter")
         def _(event):
             if not self.state.running:
+                if self.state.screen == "audio-settings":
+                    if self.state.settings_edit_key is not None:
+                        self._commit_setting_edit()
+                    else:
+                        self._settings_enter(self.state.cursor)
+                    return
                 self._dispatch(self.state.cursor)
 
-        for key, idx in [("1", 0), ("2", 1), ("3", 2), ("4", 3), ("5", 4), ("6", 5)]:
+        @kb.add("left")
+        def _(event):
+            if not self.state.running and self.state.settings_edit_key is None:
+                if self.state.screen == "audio-settings":
+                    self._settings_step(self.state.cursor, -1)
+
+        @kb.add("right")
+        def _(event):
+            if not self.state.running and self.state.settings_edit_key is None:
+                if self.state.screen == "audio-settings":
+                    self._settings_step(self.state.cursor, 1)
+
+        for key, idx in [("1", 0), ("2", 1), ("3", 2), ("4", 3), ("5", 4), ("6", 5), ("7", 6)]:
             @kb.add(key)
             def _(event, idx=idx):
-                if not self.state.running:
-                    n = len(self.state.menu)
-                    if idx < n:
-                        self.state.cursor = idx
-                        self._dispatch(idx)
+                if self.state.running or self.state.screen == "audio-settings":
+                    return
+                n = len(self.state.menu)
+                if idx < n:
+                    self.state.cursor = idx
+                    self._dispatch(idx)
+
+        for key in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "."):
+            @kb.add(key)
+            def _(event, key=key):
+                if self.state.running or self.state.settings_edit_key is None:
+                    return
+                self.state.settings_edit_buffer += key
+                self._invalidate()
+
+        @kb.add("backspace")
+        def _(event):
+            if self.state.settings_edit_key is not None:
+                self.state.settings_edit_buffer = self.state.settings_edit_buffer[:-1]
+                self._invalidate()
 
         @kb.add("s-up")
         def _(event):
@@ -1074,10 +1255,18 @@ class PixelTUI:
                 self.state.scroll_y += jump
                 self._invalidate()
 
-        @kb.add("escape")
         @kb.add("q")
         def _(event):
-            if not self.state.running:
+            if not self.state.running and self.state.settings_edit_key is None:
+                self._quit()
+
+        @kb.add("escape")
+        def _(event):
+            if self.state.settings_edit_key is not None:
+                self._cancel_setting_edit()
+            elif self.state.screen == "audio-settings" and not self.state.running:
+                self._back_audio_settings()
+            elif not self.state.running:
                 self._quit()
 
         @kb.add("c-c")
@@ -1091,8 +1280,9 @@ class PixelTUI:
         if s == "main":
             {0: self._enter_image_mode,
              1: self._enter_video_mode,
-             2: self._enter_ascii_mode,
-             3: self._quit}[idx]()
+             2: self._enter_audio_mode,
+             3: self._enter_ascii_mode,
+             4: self._quit}[idx]()
         elif s == "image":
             {0: self._select_source,
              1: self._select_target,
@@ -1107,6 +1297,15 @@ class PixelTUI:
              3: self._save_result_video,
              4: self._back_to_main,
              5: self._quit}[idx]()
+        elif s == "audio":
+            {0: self._select_source_audio,
+             1: self._select_target_audio,
+             2: self._enter_audio_settings,
+             3: self._run_audio,
+             4: self._play_result_audio,
+             5: self._save_result_audio,
+             6: self._back_to_main,
+             7: self._quit}[idx]()
         elif s == "ascii":
             {0: self._select_source_ascii,
              1: self._run_ascii,
@@ -1131,6 +1330,127 @@ class PixelTUI:
         self.state.status = "Select source and target videos"
         self.state.status_style = "status-info"
         self._refresh_info()
+        self._invalidate()
+
+    def _enter_audio_mode(self):
+        self.state.screen = "audio"
+        self.state.cursor = 0
+        self.state.status = "Select source and target audio files"
+        self.state.status_style = "status-info"
+        self._refresh_info()
+        self._invalidate()
+
+    def _enter_audio_settings(self):
+        self.state.screen = "audio-settings"
+        self.state.cursor = 0
+        self.state.settings_edit_key = None
+        self.state.settings_edit_buffer = ""
+        self.state.status = "Adjust the audio pipeline: enter to edit, arrows to step"
+        self.state.status_style = "status-info"
+        self._invalidate()
+
+    def _back_audio_settings(self):
+        self.state.screen = "audio"
+        self.state.cursor = 2
+        self.state.status = "Advanced options updated"
+        self.state.status_style = "status"
+        self._invalidate()
+
+    def _settings_get(self, key):
+        return getattr(self.state.audio_settings, key)
+
+    def _settings_set(self, key, value):
+        setattr(self.state.audio_settings, key, value)
+        self._persist_audio_settings()
+        self._invalidate()
+
+    def _persist_audio_settings(self):
+        try:
+            save_audio_settings(self.state.audio_settings.to_dict())
+        except Exception:
+            pass
+
+    def _settings_row(self, idx):
+        """Return the row descriptor for a settings index, or None for reset."""
+        if 0 <= idx < len(AUDIO_SETTINGS_ROWS):
+            return AUDIO_SETTINGS_ROWS[idx]
+        return None
+
+    def _settings_step(self, idx, direction):
+        row = self._settings_row(idx)
+        if row is None:
+            return
+        key, label, kind, *extra = row
+        if kind == "bool":
+            self._settings_set(key, not self._settings_get(key))
+            return
+        if kind == "choice":
+            opts = extra[0]
+            cur = self._settings_get(key)
+            if cur in opts:
+                new = opts[(opts.index(cur) + (1 if direction > 0 else -1)) % len(opts)]
+            else:
+                new = opts[0]
+            self._settings_set(key, new)
+            return
+        step, lo, hi = extra[0]
+        cur = self._settings_get(key)
+        value = (float(cur) if kind == "float" else int(cur)) + direction * step
+        value = min(max(value, lo), hi)
+        self._settings_set(key, int(value) if kind == "int" else round(value, 4))
+
+    def _settings_enter(self, idx):
+        row = self._settings_row(idx)
+        if row is None:
+            self._reset_audio_settings()
+            return
+        key, label, kind, *extra = row
+        if kind == "bool":
+            self._settings_set(key, not self._settings_get(key))
+        elif kind == "choice":
+            self._settings_step(idx, 1)
+        else:
+            self.state.settings_edit_key = key
+            self.state.settings_edit_buffer = str(self._settings_get(key))
+            self._invalidate()
+
+    def _commit_setting_edit(self):
+        key = self.state.settings_edit_key
+        row = None
+        for r in AUDIO_SETTINGS_ROWS:
+            if r[0] == key:
+                row = r
+                break
+        if row is not None:
+            kind = row[2]
+            extra = row[3:]
+            buf = self.state.settings_edit_buffer.strip()
+            try:
+                if kind == "int":
+                    value = int(float(buf)) if buf else 0
+                else:
+                    value = float(buf) if buf else 0.0
+                if extra:
+                    step, lo, hi = extra[0]
+                    value = min(max(value, lo), hi)
+                value = int(value) if kind == "int" else round(value, 4)
+                self._settings_set(key, value)
+            except ValueError:
+                pass
+        self.state.settings_edit_key = None
+        self.state.settings_edit_buffer = ""
+        self._invalidate()
+
+    def _cancel_setting_edit(self):
+        self.state.settings_edit_key = None
+        self.state.settings_edit_buffer = ""
+        self._invalidate()
+
+    def _reset_audio_settings(self):
+        self.state.audio_settings = AudioSettings.default()
+        self._persist_audio_settings()
+        self.state.status = "Advanced options reset to defaults"
+        self.state.status_style = "status"
         self._invalidate()
 
     def _back_to_main(self):
@@ -1178,6 +1498,30 @@ class PixelTUI:
 
     def _select_target_video(self):
         path = select_file("Select Target Video", "video")
+        if path:
+            self.state.target = path
+            self._refresh_info()
+            self.state.status = f"Target: {Path(path).name}"
+            self.state.status_style = "status"
+        else:
+            self.state.status = "Selection cancelled"
+            self.state.status_style = "status-info"
+        self._invalidate()
+
+    def _select_source_audio(self):
+        path = select_file("Select Source Audio", "audio")
+        if path:
+            self.state.source = path
+            self._refresh_info()
+            self.state.status = f"Source: {Path(path).name}"
+            self.state.status_style = "status"
+        else:
+            self.state.status = "Selection cancelled"
+            self.state.status_style = "status-info"
+        self._invalidate()
+
+    def _select_target_audio(self):
+        path = select_file("Select Target Audio", "audio")
         if path:
             self.state.target = path
             self._refresh_info()
@@ -1254,6 +1598,89 @@ class PixelTUI:
 
         if self._app:
             asyncio.create_task(waiter())
+
+    def _run_audio(self):
+        if not self.state.source:
+            self.state.status = "Select a source audio file first!"
+            self.state.status_style = "status-error"; self._invalidate(); return
+        if not self.state.target:
+            self.state.status = "Select a target audio file first!"
+            self.state.status_style = "status-error"; self._invalidate(); return
+
+        self.state.running = True
+        self.state.done = False
+        self.state.result_audio_path = ""
+        self.state.status = "Audio rearrangement running\u2026"
+        self.state.status_style = "status-warn"
+        self._invalidate()
+
+        out_path = tempfile.mktemp(suffix=".wav")
+
+        def work():
+            try:
+                rearrange_audio(
+                    self.state.source, self.state.target, out_path,
+                    settings=self.state.audio_settings,
+                )
+                self.state.result_audio_path = out_path
+                self.state.done = True
+                self.state.status = "Audio rearrangement complete!"
+                self.state.status_style = "status"
+            except Exception as e:
+                self.state.status = f"Error: {e}"
+                self.state.status_style = "status-error"
+                if os.path.exists(out_path):
+                    try: os.unlink(out_path)
+                    except: pass
+            self.state.running = False
+            self._invalidate()
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+
+        async def waiter():
+            while t.is_alive():
+                await asyncio.sleep(0.5)
+                self._invalidate()
+            self._invalidate()
+
+        if self._app:
+            asyncio.create_task(waiter())
+
+    def _save_result_audio(self):
+        if not self.state.result_audio_path or not os.path.exists(self.state.result_audio_path):
+            self.state.status = "No result to save \u2014 run rearrangement first!"
+            self.state.status_style = "status-error"
+            self._invalidate()
+            return
+
+        src_stem = Path(self.state.source).stem
+        tgt_stem = Path(self.state.target).stem
+        out_name = f"morphed_{src_stem}_from_{tgt_stem}.wav"
+        out_path = Path.cwd() / out_name
+        shutil.copy2(self.state.result_audio_path, str(out_path))
+        self.state.status = f"Saved to {out_path}"
+        self.state.status_style = "status"
+        self._invalidate()
+
+    def _play_result_audio(self):
+        if not self.state.result_audio_path or not os.path.exists(self.state.result_audio_path):
+            self.state.status = "No result to play \u2014 run rearrangement first!"
+            self.state.status_style = "status-error"
+            self._invalidate()
+            return
+
+        try:
+            if os.name == "nt":
+                os.startfile(self.state.result_audio_path)
+            else:
+                subprocess.Popen(["xdg-open", self.state.result_audio_path])
+            self.state.status = "Playing result audio\u2026"
+            self.state.status_style = "status"
+        except Exception as e:
+            self.state.status = f"Play error: {e}"
+            self.state.status_style = "status-error"
+        self._invalidate()
 
     def _enter_ascii_mode(self):
         self.state.screen = "ascii"
@@ -1357,6 +1784,17 @@ class PixelTUI:
                         h, w = img.shape[:2]
                         kb = Path(path).stat().st_size / 1024
                         parts.append(f"{Path(path).name}  {w}\u00d7{h}  ({kb:.0f} KB)")
+                elif s.screen == "audio":
+                    if HAS_SOUNDFILE:
+                        info = sf.info(path)
+                        dur = info.duration
+                        sr = info.samplerate
+                        ch = info.channels
+                        kb = Path(path).stat().st_size / 1024
+                        parts.append(f"{Path(path).name}  {sr}Hz  {ch}ch  {dur:.1f}s  ({kb:.0f} KB)")
+                    else:
+                        kb = Path(path).stat().st_size / 1024
+                        parts.append(f"{Path(path).name}  ({kb:.0f} KB)")
                 else:
                     ext = Path(path).suffix.lower()
                     if ext in _IMAGE_EXTS:
@@ -1413,9 +1851,10 @@ class PixelTUI:
 
     def _quit(self):
         cv2.destroyAllWindows()
-        if self.state.result_video_path and os.path.exists(self.state.result_video_path):
-            try: os.unlink(self.state.result_video_path)
-            except: pass
+        for p in (self.state.result_video_path, self.state.result_audio_path):
+            if p and os.path.exists(p):
+                try: os.unlink(p)
+                except: pass
         if self._app:
             self._app.exit()
         sys.exit(0)
@@ -1527,8 +1966,77 @@ class PixelTUI:
             help_extra = "  \u2022  Shift+arrows  \u2022  PgUp/Dn jump" if s.result_ascii else ""
             push("#585858 italic", f"\u2191\u2193  navigate  \u2022  Enter  select  \u2022  1-{n}  shortcut{help_extra}  \u2022  q  quit")
             push("#585858 italic", "\n")
+        elif s.screen == "audio-settings":
+            push("bold #00d787", "  \u25a0 Pixel Rearrangement Tool")
+            push("bold #5f87ff", "  \u2014  [ Audio \u00b7 Advanced Options ]")
+            push("", "\n")
+            push("#3a3a3a", "  " + "\u2501" * 55)
+            push("", "\n")
+
+            section_starts = {
+                0: "What the rearrangement may change",
+                5: "Segmentation / DSP",
+                9: "Sorting / variation",
+                13: "Pitch",
+                15: "Spectral phase",
+                16: "Output",
+            }
+
+            editing = s.settings_edit_key
+            n_rows = len(AUDIO_SETTINGS_ROWS) + 1
+            for i in range(n_rows):
+                sel = i == s.cursor
+                if i < len(AUDIO_SETTINGS_ROWS):
+                    row = AUDIO_SETTINGS_ROWS[i]
+                    if i in section_starts:
+                        push("", "\n")
+                        push("bold #00d787", f"  \u25a0 {section_starts[i]}")
+                        push("", "\n")
+                    key, label, kind, *extra = row
+                    cur = s.audio_settings.__dict__.get(key)
+                    if kind == "bool":
+                        value_txt = "on" if cur else "off"
+                    elif kind == "choice":
+                        value_txt = str(cur)
+                    elif kind == "int":
+                        value_txt = str(cur)
+                    else:
+                        value_txt = ("%.3f" % cur).rstrip("0").rstrip(".")
+                    if key == editing:
+                        value_txt = "> " + s.settings_edit_buffer + " \u2588"
+                        carat = "\u25ce"
+                    else:
+                        carat = "\u25cf" if sel else "\u25cb"
+                    st = ("bold #000000 bg:#00d787" if sel else
+                          "bold #88ffd0" if key == editing else
+                          ("bold #5fafff" if kind in ("int", "float", "choice") else "bold #ffffff"))
+                    push(st, f"  {carat} {label}")
+                    push("", "   ")
+                    push("bold #ffffff", value_txt)
+                    push("", "\n")
+                else:
+                    carat = "\u25cf" if sel else "\u25cb"
+                    st = ("bold #000000 bg:#ff5f5f" if sel else "bold #ff5f5f")
+                    push(st, f"  {carat} Reset to default settings")
+                    push("", "\n")
+
+            push("", "\n")
+            push("#3a3a3a", "  " + "\u2500" * 55)
+            push("", "\n  ")
+
+            c = {"status": "#5faf5f", "status-error": "#ff5f5f",
+                 "status-warn": "#ffaf5f", "status-info": "#878787 italic"}
+            push(c.get(s.status_style, "#878787 italic"), s.status)
+            push("", "\n")
+
+            if editing:
+                hint = "type value  \u2022  Enter commit  \u2022  Esc cancel"
+            else:
+                hint = "\u2191\u2193  move  \u2022  Enter toggle/edit  \u2022  \u2190\u2192  step  \u2022  Esc back"
+            push("#585858 italic", "  " + hint)
+            push("#585858 italic", "\n")
         else:
-            mode_label = "Image Mode" if s.screen == "image" else "Video Mode"
+            mode_label = {"image": "Image Mode", "video": "Video Mode", "audio": "Audio Mode"}[s.screen]
             push("bold #00d787", f"  \u25a0 Pixel Rearrangement Tool")
             push("bold #5f87ff", f"  \u2014  [ {mode_label} ]")
             push("", "\n")
@@ -1553,8 +2061,9 @@ class PixelTUI:
             for i, (label, desc) in enumerate(s.menu):
                 cursor = "\u25cf" if i == s.cursor else "\u25cb"
                 sel = i == s.cursor
-                is_save = (s.screen == "image" and i == 3) or (s.screen == "video" and i == 3)
-                disabled = is_save and not s.done
+                is_play = s.screen == "audio" and i == 4
+                is_save = (s.screen in ("image", "video") and i == 3) or (s.screen == "audio" and i == 5)
+                disabled = (is_play or is_save) and not s.done
                 st = ("bold #000000 bg:#00d787" if sel else
                       "#585858 italic" if disabled else
                       "bold #ffffff")
@@ -1626,6 +2135,7 @@ def main():
                 "    img2img   <source> <target>   Rearrange pixels between two images\n"
                 "    vid2vid   <source> <target>   Rearrange frames between two videos\n"
                 "    img2ascii <image>             Convert an image to ASCII art\n"
+                "    aud2aud   <source> <target>   Rearrange audio (spectral cross-synthesis by default)\n"
                 "    help                          Show this help message"
             )
         _orig_error(msg)
@@ -1653,6 +2163,44 @@ def main():
     p_ascii.add_argument("-w", "--width", type=int, default=120, help="ASCII output width in characters (default: 120)")
     p_ascii.add_argument("--no-dither", action="store_true", help="disable Floyd-Steinberg dithering")
 
+    p_aud2aud = sub.add_parser("aud2aud", help="rearrange audio (spectral cross-synthesis by default)")
+    p_aud2aud.add_argument("source", help="source audio path")
+    p_aud2aud.add_argument("target", help="target audio path")
+    p_aud2aud.add_argument("-o", "--output", help="output audio path (default: auto-named)")
+    p_aud2aud.add_argument("--cpu", action="store_true", help="force CPU mode")
+    p_aud2aud.add_argument("--spectral", action="store_true",
+                          help="enable spectral magnitude remapping (STFT, on by default)")
+    p_aud2aud.add_argument("--no-spectral", action="store_true",
+                          help="disable spectral frequency remapping")
+    p_aud2aud.add_argument("--time", action="store_true",
+                          help="enable time-domain segment reordering")
+    p_aud2aud.add_argument("--no-time", action="store_true",
+                          help="disable time-domain segment reordering")
+    p_aud2aud.add_argument("--chunk-ms", type=float,
+                          help="segment length in ms for time reorder (default: 60)")
+    p_aud2aud.add_argument("--crossfade", type=float,
+                          help="crossfade length in ms between segments (default: 0 = hard cuts)")
+    p_aud2aud.add_argument("--fft", type=int, help="FFT size for spectral mode (default: 2048)")
+    p_aud2aud.add_argument("--hop", type=int, help="hop length for spectral mode (default: 512)")
+    p_aud2aud.add_argument("--sort-key", choices=["energy", "amplitude", "zcr", "centroid", "none"],
+                          help="per-segment sort key (default: energy)")
+    p_aud2aud.add_argument("--randomize", action="store_true",
+                          help="randomly shuffle segments instead of sorting")
+    p_aud2aud.add_argument("--seed", type=int, help="random seed (default: 0)")
+    p_aud2aud.add_argument("--reverse", action="store_true", help="reverse the segment order")
+    p_aud2aud.add_argument("--pitch", type=float,
+                          help="pitch shift in semitones, e.g. -12 or +7")
+    p_aud2aud.add_argument("--no-keep-duration", action="store_true",
+                          help="let pitch shifting also change the duration")
+    p_aud2aud.add_argument("--phase", choices=["source", "target", "random"],
+                          help="spectral phase source (default: source)")
+    p_aud2aud.add_argument("--energy", action="store_true",
+                          help="match per-segment loudness to the target")
+    p_aud2aud.add_argument("--dry-wet", type=float, choices=[round(x / 20.0, 2) for x in range(0, 21)],
+                          help="dry/wet mix 0.0-1.0 (default: 0 = full effect)")
+    p_aud2aud.add_argument("--no-normalize", action="store_true",
+                          help="disable output peak normalization")
+
     p_help = sub.add_parser("help", help="show this help message and exit")
 
     args = parser.parse_args()
@@ -1673,6 +2221,7 @@ def main():
         "img2img": _cli_img2img,
         "vid2vid": _cli_vid2vid,
         "img2ascii": _cli_img2ascii,
+        "aud2aud": _cli_aud2aud,
         "help": lambda _: parser.print_help(),
     }
     signal.signal(signal.SIGINT, _sigint_handler)
