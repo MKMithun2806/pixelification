@@ -123,6 +123,26 @@ Status: Video: [████████████░░░░░░] 62.0% (1
 
 ---
 
+### ▸ Audio Mode
+
+Rearrange audio between two files. By default it performs **spectral cross-synthesis**
+– the source's pitch/timbre are preserved while its spectral structure is reshaped
+toward the target. A **time-domain** cut-and-splice mode, pitch shifting, and more are
+available via the **Advanced Audio Options** screen or `aud2aud` CLI flags:
+
+```
+Default        spectral magnitude remap (source phase)
+--time         also/splice segments and reorder them
+--pitch 7      pitch shift (+7 semitones)
+--randomize    shuffle segments
+--dry-wet 0.5  blend with the original
+```
+
+Audio I/O is handled by `soundfile`/libsndfile — WAV, FLAC, OGG, AIFF, and **MP3**
+with **no FFmpeg** required.
+
+---
+
 ## ◈ Installation
 
 ### Using uv (Recommended)
@@ -190,6 +210,7 @@ A keyboard-navigated menu opens:
 
   ● Rearrange Images    sort pixels between two images
   ○ Rearrange Videos    sort frames between two videos
+  ○ Rearrange Audio     spectral cross-synthesis between two audio clips
   ○ ASCII               convert images to ASCII art
   ○ Quit                exit the application
 ```
@@ -221,6 +242,16 @@ A keyboard-navigated menu opens:
 4. Result plays in an OpenCV window — loops until `ESC`/`q` or window close
 5. Click **"Save Result Video"** to export
 
+### Audio Mode
+
+1. Select a **source** and a **target** audio file
+2. Optionally open **"Advanced Audio Options"** to tune the pipeline
+3. Press **"Run Audio Rearrangement"** (default: spectral cross-synthesis)
+4. **"Play Result Audio"** previews the temp result with your system player
+5. **"Save Result Audio"** writes `morphed_{src}_from_{tgt}.wav`
+
+> See [docs/audio.md](docs/audio.md) for a full explanation of every advanced setting.
+
 ### ASCII Art Mode
 
 1. Select an image file
@@ -239,6 +270,7 @@ For scripting, batch processing, or headless environments, use the subcommand in
 pixelification img2img <source> <target> [options]
 pixelification vid2vid <source> <target> [options]
 pixelification img2ascii <image> [options]
+pixelification aud2aud <source> <target> [options]
 ```
 
 Output paths default to auto-named files in the current directory (e.g. `reconstructed_src_from_tgt.png`).
@@ -268,6 +300,24 @@ pixelification img2ascii <image>
   -w, --width CHARS    output width in characters (default: 120)
   --no-dither          disable Floyd-Steinberg dithering
 
+pixelification aud2aud <source> <target>
+  Rearrange audio (spectral cross-synthesis by default). Writes a WAV.
+
+  -o, --output FILE    output audio path (default: auto-named)
+  --spectral / --no-spectral   toggle spectral frequency remapping
+  --time               enable time-domain segment reordering
+  --chunk-ms FLOAT     segment length in ms for time reorder (default: 60)
+  --crossfade FLOAT    crossfade between segments in ms (default: 0)
+  --fft INT / --hop INT         spectral FFT size / hop (default: 2048 / 512)
+  --sort-key KEY       energy|amplitude|zcr|centroid|none (default: energy)
+  --randomize / --seed INT      shuffle segments / seed
+  --reverse            reverse segment order
+  --pitch FLOAT        pitch shift in semitones (e.g. -12, +7)
+  --phase MODE         source|target|random (default: source)
+  --energy             match per-segment loudness to target
+  --dry-wet FLOAT      dry/wet mix 0.0-1.0 (default: 0)
+  --no-normalize       disable peak normalization
+
 pixelification --version / -v
   Print the installed version.
 ```
@@ -281,6 +331,7 @@ Python     ≥ 3.10
 OpenCV     cv2
 NumPy
 prompt_toolkit
+soundfile     # audio: WAV/FLAC/OGG/AIFF/MP3 (bundles libsndfile, no FFmpeg)
 
 # Optional — installed automatically on supported platforms:
 cupy-cuda13x[ctk]    # NVIDIA CUDA acceleration (Linux / Windows)
@@ -290,15 +341,19 @@ python3-tk           # Linux only — for file dialog fallback
 
 ---
 
-## ◈ Rust Component
+## ◈ Documentation
 
-The codebase also includes **Aster Browser** — a Rust-based Win32 application.
+Full, user-and-developer documentation lives in **[`docs/`](docs/index.md)**:
 
-> ⚠️ Windows only.
-
-```bash
-cargo build --release
-```
+| Document | Covers |
+|---|---|
+| [docs/index.md](docs/index.md) | Overview, quick start, table of contents |
+| [docs/installation.md](docs/installation.md) | Install, requirements, CUDA, config file |
+| [docs/cli.md](docs/cli.md) | Complete CLI reference |
+| [docs/tui.md](docs/tui.md) | Interactive terminal UI guide |
+| [docs/audio.md](docs/audio.md) | Audio engine, advanced settings, presets |
+| [docs/python-api.md](docs/python-api.md) | Code / API reference |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Troubleshooting |
 
 ---
 
